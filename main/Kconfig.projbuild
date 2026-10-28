@@ -1,49 +1,21 @@
-menu "Example Configuration"
+menu "Relay Wi-Fi Configuration"
 
-    orsource "$IDF_PATH/examples/common_components/env_caps/$IDF_TARGET/Kconfig.env_caps"
-
-    choice BLINK_LED
-        prompt "Blink LED type"
-        default BLINK_LED_GPIO
+    config RELAY_WIFI_SSID
+        string "Wi-Fi network name (SSID)"
+        default ""
         help
-            Select the LED type. A normal level controlled LED or an addressable LED strip.
-            The default selection is based on the Espressif DevKit boards.
-            You can change the default selection according to your board.
+            Name of the Wi-Fi network the ESP32 should join.
 
-        config BLINK_LED_GPIO
-            bool "GPIO"
-        config BLINK_LED_STRIP
-            bool "LED strip"
-    endchoice
-
-    choice BLINK_LED_STRIP_BACKEND
-        depends on BLINK_LED_STRIP
-        prompt "LED strip backend peripheral"
-        default BLINK_LED_STRIP_BACKEND_RMT if SOC_RMT_SUPPORTED
-        default BLINK_LED_STRIP_BACKEND_SPI
+    config RELAY_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
         help
-            Select the backend peripheral to drive the LED strip.
+            Password for the Wi-Fi network.
 
-        config BLINK_LED_STRIP_BACKEND_RMT
-            depends on SOC_RMT_SUPPORTED
-            bool "RMT"
-        config BLINK_LED_STRIP_BACKEND_SPI
-            bool "SPI"
-    endchoice
-
-    config BLINK_GPIO
-        int "Blink GPIO number"
-        range ENV_GPIO_RANGE_MIN ENV_GPIO_OUT_RANGE_MAX
-        default 8
+    config RELAY_CONTROL_PASSWORD
+        string "Relay HTTP password (12 to 64 characters)"
+        default ""
         help
-            GPIO number (IOxx) to blink on and off the LED.
-            Some GPIOs are used for other purposes (flash connections, etc.) and cannot be used to blink.
-
-    config BLINK_PERIOD
-        int "Blink period in ms"
-        range 10 3600000
-        default 1000
-        help
-            Define the blinking period in milliseconds.
+            Password required in the X-Relay-Password request header.
 
 endmenu
