@@ -18,4 +18,18 @@ menu "Relay Wi-Fi Configuration"
         help
             Password required in the X-Relay-Password request header.
 
+    config RELAY_PULSE_MIN_MS
+        int "Minimum relay pulse (milliseconds)"
+        range 1 30000
+        default 100
+        help
+            Shortest relay pulse duration accepted by the HTTP endpoint.
+
+    config RELAY_PULSE_MAX_MS
+        int "Maximum relay pulse (milliseconds)"
+        range 1 30000
+        default 2000
+        help
+            Longest relay pulse duration accepted by the HTTP endpoint.
+
 endmenu

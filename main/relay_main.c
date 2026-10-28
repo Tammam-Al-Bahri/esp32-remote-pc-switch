@@ -5,17 +5,24 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_http_server.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 #include <stdbool.h>
-#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define RELAY_GPIO GPIO_NUM_2
 #define RELAY_PASSWORD_HEADER "X-Relay-Password"
+#define RELAY_PULSE_QUERY_KEY "duration"
+#define RELAY_QUERY_MAX_LENGTH 64
 
 static const char *TAG = "relay";
 static httpd_handle_t s_http_server;
+static esp_timer_handle_t s_relay_timer;
+static portMUX_TYPE s_relay_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_relay_pulsing;
 
 static bool request_is_authorized(httpd_req_t *request)
 {
@@ -46,33 +53,88 @@ static esp_err_t send_unauthorized(httpd_req_t *request)
     return httpd_resp_sendstr(request, "Invalid relay password\n");
 }
 
-static esp_err_t set_relay(httpd_req_t *request, bool turn_on)
+static esp_err_t send_bad_request(httpd_req_t *request)
+{
+    httpd_resp_set_status(request, "400 Bad Request");
+    httpd_resp_set_type(request, "text/plain");
+    return httpd_resp_sendstr(request, "Invalid duration\n");
+}
+
+static esp_err_t relay_pulse_handler(httpd_req_t *request)
 {
     if (!request_is_authorized(request)) {
         return send_unauthorized(request);
     }
 
-    esp_err_t result = gpio_set_level(RELAY_GPIO, turn_on ? 1 : 0);
-    if (result != ESP_OK) {
-        ESP_LOGE(TAG, "Could not set relay GPIO: %s", esp_err_to_name(result));
-        httpd_resp_set_status(request, "500 Internal Server Error");
-        return httpd_resp_sendstr(request, "Could not set relay\n");
+    char query[RELAY_QUERY_MAX_LENGTH];
+    const size_t query_length = httpd_req_get_url_query_len(request);
+    if (query_length == 0 || query_length >= sizeof(query) ||
+        httpd_req_get_url_query_str(request, query, sizeof(query)) != ESP_OK) {
+        return send_bad_request(request);
     }
 
-    ESP_LOGI(TAG, "Relay turned %s", turn_on ? "ON" : "OFF");
+    char duration_text[16];
+    if (httpd_query_key_value(query, RELAY_PULSE_QUERY_KEY, duration_text,
+                              sizeof(duration_text)) != ESP_OK || duration_text[0] == '\0') {
+        return send_bad_request(request);
+    }
+
+    for (const char *character = duration_text; *character != '\0'; character++) {
+        if (*character < '0' || *character > '9') {
+            return send_bad_request(request);
+        }
+    }
+
+    char *end = NULL;
+    const unsigned long duration = strtoul(duration_text, &end, 10);
+    if (end == duration_text || *end != '\0' ||
+        duration < CONFIG_RELAY_PULSE_MIN_MS ||
+        duration > CONFIG_RELAY_PULSE_MAX_MS) {
+        return send_bad_request(request);
+    }
+
+    portENTER_CRITICAL(&s_relay_lock);
+    const bool already_pulsing = s_relay_pulsing;
+    if (!already_pulsing) {
+        s_relay_pulsing = true;
+    }
+    portEXIT_CRITICAL(&s_relay_lock);
+
+    if (already_pulsing) {
+        httpd_resp_set_status(request, "409 Conflict");
+        httpd_resp_set_type(request, "text/plain");
+        return httpd_resp_sendstr(request, "Relay pulse already active\n");
+    }
+
+    esp_err_t result = gpio_set_level(RELAY_GPIO, 1);
+    if (result == ESP_OK) {
+        result = esp_timer_start_once(s_relay_timer, (uint64_t)duration * 1000);
+    }
+    if (result != ESP_OK) {
+        gpio_set_level(RELAY_GPIO, 0);
+        portENTER_CRITICAL(&s_relay_lock);
+        s_relay_pulsing = false;
+        portEXIT_CRITICAL(&s_relay_lock);
+        ESP_LOGE(TAG, "Could not start relay pulse: %s", esp_err_to_name(result));
+        httpd_resp_set_status(request, "500 Internal Server Error");
+        return httpd_resp_sendstr(request, "Could not start relay pulse\n");
+    }
+
+    ESP_LOGI(TAG, "Relay pulse started for %lu ms", duration);
     httpd_resp_set_type(request, "text/plain");
     httpd_resp_set_hdr(request, "Cache-Control", "no-store");
-    return httpd_resp_sendstr(request, turn_on ? "Relay is ON\n" : "Relay is OFF\n");
+    return httpd_resp_sendstr(request, "Relay pulse started\n");
 }
 
-static esp_err_t relay_on_handler(httpd_req_t *request)
+static void relay_pulse_timeout(void *argument)
 {
-    return set_relay(request, true);
-}
+    (void)argument;
 
-static esp_err_t relay_off_handler(httpd_req_t *request)
-{
-    return set_relay(request, false);
+    gpio_set_level(RELAY_GPIO, 0);
+    portENTER_CRITICAL(&s_relay_lock);
+    s_relay_pulsing = false;
+    portEXIT_CRITICAL(&s_relay_lock);
+    ESP_LOGI(TAG, "Relay pulse finished; relay is OFF");
 }
 
 static void stop_http_server(void)
@@ -96,25 +158,19 @@ static void start_http_server(void)
         return;
     }
 
-    const httpd_uri_t relay_on_uri = {
-        .uri = "/relay/on",
+    const httpd_uri_t relay_pulse_uri = {
+        .uri = "/relay/pulse",
         .method = HTTP_POST,
-        .handler = relay_on_handler,
-    };
-    const httpd_uri_t relay_off_uri = {
-        .uri = "/relay/off",
-        .method = HTTP_POST,
-        .handler = relay_off_handler,
+        .handler = relay_pulse_handler,
     };
 
-    if (httpd_register_uri_handler(s_http_server, &relay_on_uri) != ESP_OK ||
-        httpd_register_uri_handler(s_http_server, &relay_off_uri) != ESP_OK) {
+    if (httpd_register_uri_handler(s_http_server, &relay_pulse_uri) != ESP_OK) {
         ESP_LOGE(TAG, "Could not register relay HTTP routes");
         stop_http_server();
         return;
     }
 
-    ESP_LOGI(TAG, "HTTP relay control is ready: POST /relay/on or POST /relay/off");
+    ESP_LOGI(TAG, "HTTP relay control is ready: POST /relay/pulse?duration=...");
 }
 
 static void wifi_event_handler(void *argument, esp_event_base_t event_base,
@@ -179,6 +235,18 @@ void app_main(void)
     ESP_ERROR_CHECK(gpio_set_direction(RELAY_GPIO, GPIO_MODE_OUTPUT));
     ESP_ERROR_CHECK(gpio_set_level(RELAY_GPIO, 0));
     ESP_LOGI(TAG, "Relay initialised OFF on GPIO %d", RELAY_GPIO);
+
+    if (CONFIG_RELAY_PULSE_MIN_MS < 1 ||
+        CONFIG_RELAY_PULSE_MIN_MS > CONFIG_RELAY_PULSE_MAX_MS) {
+        ESP_LOGE(TAG, "Configure valid relay pulse duration limits in menuconfig");
+        return;
+    }
+
+    const esp_timer_create_args_t relay_timer_args = {
+        .callback = relay_pulse_timeout,
+        .name = "relay_pulse",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&relay_timer_args, &s_relay_timer));
 
     esp_err_t nvs_result = nvs_flash_init();
     if (nvs_result == ESP_ERR_NVS_NO_FREE_PAGES || nvs_result == ESP_ERR_NVS_NEW_VERSION_FOUND) {
