@@ -17,12 +17,37 @@
 #define RELAY_PASSWORD_HEADER "X-Relay-Password"
 #define RELAY_PULSE_QUERY_KEY "duration"
 #define RELAY_QUERY_MAX_LENGTH 64
+#define WIFI_RETRY_DELAY_US 2000000ULL
 
 static const char *TAG = "relay";
 static httpd_handle_t s_http_server;
 static esp_timer_handle_t s_relay_timer;
+static esp_timer_handle_t s_wifi_retry_timer;
 static portMUX_TYPE s_relay_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool s_relay_pulsing;
+
+static void schedule_wifi_retry(void)
+{
+    if (esp_timer_is_active(s_wifi_retry_timer)) {
+        return;
+    }
+
+    esp_err_t result = esp_timer_start_once(s_wifi_retry_timer, WIFI_RETRY_DELAY_US);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "Could not schedule Wi-Fi retry: %s", esp_err_to_name(result));
+    }
+}
+
+static void wifi_retry_timer_callback(void *argument)
+{
+    (void)argument;
+
+    esp_err_t result = esp_wifi_connect();
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi retry failed: %s", esp_err_to_name(result));
+        schedule_wifi_retry();
+    }
+}
 
 static bool request_is_authorized(httpd_req_t *request)
 {
@@ -181,11 +206,19 @@ static void wifi_event_handler(void *argument, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         ESP_ERROR_CHECK(esp_wifi_connect());
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        const wifi_event_sta_disconnected_t *disconnect_event = event_data;
         stop_http_server();
-        ESP_LOGW(TAG, "Wi-Fi disconnected; reconnecting");
-        esp_wifi_connect();
+        esp_err_t result = esp_wifi_connect();
+        ESP_LOGW(TAG, "Wi-Fi disconnected (reason %d); reconnect request: %s",
+                 disconnect_event->reason, esp_err_to_name(result));
+        if (result != ESP_OK) {
+            schedule_wifi_retry();
+        }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *event = event_data;
+        if (esp_timer_is_active(s_wifi_retry_timer)) {
+            esp_timer_stop(s_wifi_retry_timer);
+        }
         ESP_LOGI(TAG, "Connected; open http://" IPSTR, IP2STR(&event->ip_info.ip));
         start_http_server();
     }
@@ -220,6 +253,12 @@ static void initialise_wifi(void)
                                                wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                                wifi_event_handler, NULL));
+
+    const esp_timer_create_args_t wifi_retry_timer_args = {
+        .callback = wifi_retry_timer_callback,
+        .name = "wifi_retry",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&wifi_retry_timer_args, &s_wifi_retry_timer));
 
     wifi_config_t wifi_config = {0};
     memcpy(wifi_config.sta.ssid, CONFIG_RELAY_WIFI_SSID, ssid_length);
