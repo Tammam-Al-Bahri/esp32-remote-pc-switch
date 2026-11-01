@@ -30,8 +30,8 @@ on the same trusted network, send a pulse request with the configured relay
 password. This example requests a 500 millisecond pulse:
 
 ```powershell
-$headers = @{ "X-Relay-Password" = "your-long-relay-password" }
-Invoke-RestMethod -Method Post -Uri "http://ESP32-IP/relay/pulse?duration=500" -Headers $headers
+$headers = @{ 'X-Relay-Password' = 'your-long-relay-password' }
+Invoke-RestMethod -Method Post -Uri 'http://ESP32-IP/relay/pulse?duration=500' -Headers $headers
 ```
 
 If the relay is already pulsing, another request receives `409 Conflict` and
