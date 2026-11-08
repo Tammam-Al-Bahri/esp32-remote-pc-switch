@@ -38,5 +38,33 @@ If the relay is already pulsing, another request receives `409 Conflict` and
 does not extend the active pulse. Requests outside the configured duration
 limits receive `400 Bad Request`.
 
+## Reliability and diagnostics
+
+- Wi-Fi power save is disabled so the always-on server stays reachable.
+- On disconnect, the firmware reconnects with backoff (1s, 2s, 5s, then every
+  10s) and logs the disconnect reason code.
+- If there is no IP address for 120 seconds, the ESP32 reboots itself. The relay
+  always starts OFF, so a reboot is safe.
+- Run counters are kept in RTC memory (no flash wear; survives panics and
+  watchdog resets, lost on power loss). Flash (NVS) gets one small write per boot.
+- Every boot logs a line like
+  `BOOT #3 reset=PANIC | previous run: uptime>=7200s wifi_disconnects=4 ...`.
+  The reset reason is one of `power-on`, `software`, `PANIC`, `interrupt-wdt`,
+  `task-wdt`, `BROWNOUT`, and so on, which tells you whether it crashed.
+
+Read the current state with the same password header:
+
+```powershell
+Invoke-RestMethod -Uri "http://ESP32-IP/debug" -Headers $headers
+```
+
+It returns plain text: `uptime_s`, `boot_count`, `reset_reason`,
+`wifi_disconnects`, `last_disconnect_reason` (Wi-Fi reason code),
+`last_disconnect_at_s`, `rssi`, `free_heap`, `min_free_heap`, and a
+`prev_*` summary of the run before the last reboot. `prev_uptime_s` is a lower
+bound, and `prev_*` is zero after a power loss. A steadily shrinking
+`min_free_heap` points to a memory leak, and `prev_noip_watchdog_restart=1`
+means the no-IP watchdog rebooted the device.
+
 This is plain HTTP, so the password is not encrypted in transit. Use it only on
 a trusted local network; avoid exposing the ESP32's HTTP port to the internet.
