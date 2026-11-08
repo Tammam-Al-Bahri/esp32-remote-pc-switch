@@ -17,41 +17,12 @@
 #define RELAY_PASSWORD_HEADER "X-Relay-Password"
 #define RELAY_PULSE_QUERY_KEY "duration"
 #define RELAY_QUERY_MAX_LENGTH 64
-#define WIFI_WATCHDOG_PERIOD_US 5000000ULL
-#define WIFI_RESTART_AFTER_CHECKS 24 /* 24 * 5 s = restart Wi-Fi driver every 2 min while offline */
 
 static const char *TAG = "relay";
 static httpd_handle_t s_http_server;
 static esp_timer_handle_t s_relay_timer;
-static esp_timer_handle_t s_wifi_watchdog_timer;
-static volatile bool s_wifi_has_ip;
-static uint32_t s_wifi_down_checks;
 static portMUX_TYPE s_relay_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool s_relay_pulsing;
-
-/* Wi-Fi supervisor: runs forever and forces a reconnect whenever there is no IP. */
-static void wifi_watchdog_callback(void *argument)
-{
-    (void)argument;
-
-    if (s_wifi_has_ip) {
-        s_wifi_down_checks = 0;
-        return;
-    }
-
-    s_wifi_down_checks++;
-    if (s_wifi_down_checks % WIFI_RESTART_AFTER_CHECKS == 0) {
-        ESP_LOGW(TAG, "Wi-Fi down for a long time; restarting the Wi-Fi driver");
-        esp_wifi_stop();
-        esp_wifi_start(); /* STA_START event triggers a connect */
-        return;
-    }
-
-    esp_err_t result = esp_wifi_connect();
-    if (result != ESP_OK && result != ESP_ERR_WIFI_CONN) {
-        ESP_LOGW(TAG, "Wi-Fi reconnect failed: %s", esp_err_to_name(result));
-    }
-}
 
 static bool request_is_authorized(httpd_req_t *request)
 {
@@ -181,7 +152,6 @@ static void start_http_server(void)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.lru_purge_enable = true; /* recycle stale sockets so the server never runs out */
     if (httpd_start(&s_http_server, &config) != ESP_OK) {
         s_http_server = NULL;
         ESP_LOGE(TAG, "Could not start HTTP server");
@@ -209,22 +179,14 @@ static void wifi_event_handler(void *argument, esp_event_base_t event_base,
     (void)argument;
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        ESP_ERROR_CHECK(esp_wifi_connect());
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        const wifi_event_sta_disconnected_t *disconnect_event = event_data;
-        s_wifi_has_ip = false;
         stop_http_server();
-        ESP_LOGW(TAG, "Wi-Fi disconnected (reason %d); reconnecting", disconnect_event->reason);
+        ESP_LOGW(TAG, "Wi-Fi disconnected; reconnecting");
         esp_wifi_connect();
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) {
-        s_wifi_has_ip = false;
-        stop_http_server();
-        ESP_LOGW(TAG, "Lost IP address; waiting for DHCP or reconnect");
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *event = event_data;
-        s_wifi_has_ip = true;
         ESP_LOGI(TAG, "Connected; open http://" IPSTR, IP2STR(&event->ip_info.ip));
-        stop_http_server(); /* always restart clean */
         start_http_server();
     }
 }
@@ -256,24 +218,15 @@ static void initialise_wifi(void)
     ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_config));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                                wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID,
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                                wifi_event_handler, NULL));
 
-    const esp_timer_create_args_t wifi_watchdog_timer_args = {
-        .callback = wifi_watchdog_callback,
-        .name = "wifi_watchdog",
-    };
-    ESP_ERROR_CHECK(esp_timer_create(&wifi_watchdog_timer_args, &s_wifi_watchdog_timer));
-
     wifi_config_t wifi_config = {0};
-    wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
     memcpy(wifi_config.sta.ssid, CONFIG_RELAY_WIFI_SSID, ssid_length);
     memcpy(wifi_config.sta.password, CONFIG_RELAY_WIFI_PASSWORD, wifi_password_length);
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE)); /* mains powered: favour a stable link */
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_ERROR_CHECK(esp_timer_start_periodic(s_wifi_watchdog_timer, WIFI_WATCHDOG_PERIOD_US));
 }
 
 void app_main(void)
