@@ -45,6 +45,12 @@ limits receive `400 Bad Request`.
   10s) and logs the disconnect reason code.
 - If there is no IP address for 120 seconds, the ESP32 reboots itself. The relay
   always starts OFF, so a reboot is safe.
+- Once online, it pings the router (gateway) every 30 seconds. After 4 failed
+  pings in a row (about 2 minutes) it reboots, which catches the case where Wi-Fi
+  looks connected but nothing gets through. The check only activates after the
+  first successful ping, so a router that blocks ICMP cannot cause reboot loops.
+- Consecutive watchdog reboots back off (the timeouts grow each time, capped at
+  30 minutes) and the streak resets as soon as pings succeed again.
 - Run counters are kept in RTC memory (no flash wear; survives panics and
   watchdog resets, lost on power loss). Flash (NVS) gets one small write per boot.
 - Every boot logs a line like
@@ -61,10 +67,11 @@ Invoke-RestMethod -Uri "http://ESP32-IP/debug" -Headers $headers
 It returns plain text: `uptime_s`, `boot_count`, `reset_reason`,
 `wifi_disconnects`, `last_disconnect_reason` (Wi-Fi reason code),
 `last_disconnect_at_s`, `rssi`, `free_heap`, `min_free_heap`, and a
-`prev_*` summary of the run before the last reboot. `prev_uptime_s` is a lower
+`prev_*` summary of the run before the last reboot, plus `watchdog_streak`,
+`ping_ok_this_boot` and `ping_consecutive_fails`. `prev_uptime_s` is a lower
 bound, and `prev_*` is zero after a power loss. A steadily shrinking
-`min_free_heap` points to a memory leak, and `prev_noip_watchdog_restart=1`
-means the no-IP watchdog rebooted the device.
+`min_free_heap` points to a memory leak, and `prev_watchdog_restart` is
+`no-ip` or `gateway-ping` when a watchdog rebooted the device (`none` otherwise).
 
 This is plain HTTP, so the password is not encrypted in transit. Use it only on
 a trusted local network; avoid exposing the ESP32's HTTP port to the internet.

@@ -8,8 +8,10 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "esp_system.h"
+#include "lwip/ip_addr.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "ping/ping_sock.h"
 #include "sdkconfig.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -28,9 +30,20 @@ static esp_timer_handle_t s_relay_timer;
 static portMUX_TYPE s_relay_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool s_relay_pulsing;
 
-/* Reboot if Wi-Fi has had no IP for this long. */
+/* Reboot if Wi-Fi has had no IP for this long (grows with consecutive
+ * watchdog reboots, capped, so a long router outage doesn't cause reboot spam). */
 #define NOIP_REBOOT_MS (120 * 1000)
-#define DIAG_MAGIC 0xD1A60002u
+#define NOIP_REBOOT_MAX_MS (30 * 60 * 1000)
+/* Gateway ping every PING_INTERVAL_S; reboot after this many failures in a row
+ * (also grows with the streak, capped). */
+#define PING_INTERVAL_S 30
+#define PING_FAILS_BASE 4
+#define PING_FAILS_MAX 60
+#define DIAG_MAGIC 0xD1A60003u
+
+#define WD_NONE 0
+#define WD_NOIP 1
+#define WD_PING 2
 
 /* Per-run counters. Kept in RTC memory: survives panic/WDT/software resets
  * with zero flash wear (lost only on power loss). */
@@ -39,7 +52,8 @@ typedef struct {
     uint32_t disconnects;
     uint32_t last_reason;       /* last Wi-Fi disconnect reason code */
     uint32_t last_disconnect_s; /* uptime when it happened */
-    uint32_t noip_restarts;     /* 1 if the no-IP watchdog caused the restart */
+    uint32_t wd_cause;          /* WD_NOIP / WD_PING if a watchdog caused the restart */
+    uint32_t streak;            /* consecutive watchdog restarts without recovery */
     uint32_t uptime_s;          /* last uptime we knew about (updated on events) */
 } diag_t;
 
@@ -55,6 +69,14 @@ static boot_rec_t s_rec;
 static int s_retry;
 static esp_timer_handle_t s_noip_timer;
 static esp_timer_handle_t s_reconnect_timer;
+static esp_ping_handle_t s_ping;
+static volatile uint32_t s_ping_fails;
+static volatile bool s_ping_ever_ok;
+
+static const char *wd_name(uint32_t cause)
+{
+    return cause == WD_NOIP ? "no-ip" : cause == WD_PING ? "gateway-ping" : "none";
+}
 
 static uint32_t uptime_s(void)
 {
@@ -86,6 +108,7 @@ static void init_diagnostics(void)
     }
     memset(&s_diag, 0, sizeof(s_diag));
     s_diag.magic = DIAG_MAGIC;
+    s_diag.streak = prev.wd_cause != WD_NONE ? prev.streak + 1 : 0;
 
     nvs_handle_t handle;
     size_t size = sizeof(s_rec);
@@ -108,10 +131,11 @@ static void init_diagnostics(void)
     }
 
     ESP_LOGW(TAG, "BOOT #%lu reset=%s | previous run: uptime>=%lus wifi_disconnects=%lu "
-             "last_reason=%lu noip_watchdog=%lu",
+             "last_reason=%lu watchdog=%s streak=%lu",
              (unsigned long)s_rec.boot_count, reset_reason_name(s_rec.reset_reason),
              (unsigned long)prev.uptime_s, (unsigned long)prev.disconnects,
-             (unsigned long)prev.last_reason, (unsigned long)prev.noip_restarts);
+             (unsigned long)prev.last_reason, wd_name(prev.wd_cause),
+             (unsigned long)s_diag.streak);
 }
 
 static bool request_is_authorized(httpd_req_t *request)
@@ -229,7 +253,7 @@ static esp_err_t debug_handler(httpd_req_t *request)
     }
     s_diag.uptime_s = uptime_s();
 
-    char body[512];
+    char body[768];
     snprintf(body, sizeof(body),
              "uptime_s=%lu\n"
              "boot_count=%lu\n"
@@ -243,7 +267,10 @@ static esp_err_t debug_handler(httpd_req_t *request)
              "prev_uptime_s=%lu\n"
              "prev_wifi_disconnects=%lu\n"
              "prev_last_disconnect_reason=%lu\n"
-             "prev_noip_watchdog_restart=%lu\n",
+             "prev_watchdog_restart=%s\n"
+             "watchdog_streak=%lu\n"
+             "ping_ok_this_boot=%d\n"
+             "ping_consecutive_fails=%lu\n",
              (unsigned long)s_diag.uptime_s, (unsigned long)s_rec.boot_count,
              reset_reason_name(s_rec.reset_reason),
              (unsigned long)s_diag.disconnects, (unsigned long)s_diag.last_reason,
@@ -251,7 +278,9 @@ static esp_err_t debug_handler(httpd_req_t *request)
              (unsigned long)esp_get_free_heap_size(),
              (unsigned long)esp_get_minimum_free_heap_size(),
              (unsigned long)s_rec.prev.uptime_s, (unsigned long)s_rec.prev.disconnects,
-             (unsigned long)s_rec.prev.last_reason, (unsigned long)s_rec.prev.noip_restarts);
+             (unsigned long)s_rec.prev.last_reason, wd_name(s_rec.prev.wd_cause),
+             (unsigned long)s_diag.streak, (int)s_ping_ever_ok,
+             (unsigned long)s_ping_fails);
 
     httpd_resp_set_type(request, "text/plain");
     httpd_resp_set_hdr(request, "Cache-Control", "no-store");
@@ -334,17 +363,98 @@ static void reconnect_timeout(void *argument)
 
 static void arm_noip_timer(void)
 {
+    uint64_t ms = (uint64_t)NOIP_REBOOT_MS * (1 + s_diag.streak);
+    if (ms > NOIP_REBOOT_MAX_MS) {
+        ms = NOIP_REBOOT_MAX_MS;
+    }
     /* Fails harmlessly if already running, so flapping doesn't extend the deadline. */
-    esp_timer_start_once(s_noip_timer, (uint64_t)NOIP_REBOOT_MS * 1000);
+    esp_timer_start_once(s_noip_timer, ms * 1000);
+}
+
+static void watchdog_restart(uint32_t cause)
+{
+    s_diag.wd_cause = cause;
+    s_diag.uptime_s = uptime_s();
+    ESP_LOGE(TAG, "Watchdog (%s) restarting; streak=%lu", wd_name(cause),
+             (unsigned long)s_diag.streak);
+    esp_restart();
 }
 
 static void noip_timeout(void *argument)
 {
     (void)argument;
-    s_diag.noip_restarts = 1;
-    s_diag.uptime_s = uptime_s();
-    ESP_LOGE(TAG, "No IP for %d s; restarting", NOIP_REBOOT_MS / 1000);
-    esp_restart();
+    watchdog_restart(WD_NOIP);
+}
+
+static void ping_success(esp_ping_handle_t handle, void *args)
+{
+    (void)handle;
+    (void)args;
+    s_ping_fails = 0;
+    s_ping_ever_ok = true;
+    s_diag.streak = 0; /* network is demonstrably working */
+}
+
+static void ping_timeout(esp_ping_handle_t handle, void *args)
+{
+    (void)handle;
+    (void)args;
+    if (!s_ping_ever_ok) {
+        ESP_LOGW(TAG, "Gateway ping not answered yet (router may block ICMP); check inactive");
+        return;
+    }
+    s_ping_fails++;
+    uint32_t limit = PING_FAILS_BASE * (1 + s_diag.streak);
+    if (limit > PING_FAILS_MAX) {
+        limit = PING_FAILS_MAX;
+    }
+    ESP_LOGW(TAG, "Gateway ping failed (%lu/%lu)", (unsigned long)s_ping_fails,
+             (unsigned long)limit);
+    if (s_ping_fails >= limit) {
+        watchdog_restart(WD_PING);
+    }
+}
+
+static void stop_gateway_ping(void)
+{
+    if (s_ping != NULL) {
+        esp_ping_stop(s_ping);
+        esp_ping_delete_session(s_ping);
+        s_ping = NULL;
+    }
+}
+
+static void start_gateway_ping(void)
+{
+    stop_gateway_ping();
+    s_ping_fails = 0;
+
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_ip_info_t ip_info;
+    if (netif == NULL || esp_netif_get_ip_info(netif, &ip_info) != ESP_OK ||
+        ip_info.gw.addr == 0) {
+        ESP_LOGW(TAG, "No gateway address; ping check not started");
+        return;
+    }
+
+    esp_ping_config_t config = ESP_PING_DEFAULT_CONFIG();
+    config.count = ESP_PING_COUNT_INFINITE;
+    config.interval_ms = PING_INTERVAL_S * 1000;
+    config.timeout_ms = 3000;
+    ip_addr_t target = {0};
+    ip_addr_copy_from_ip4(target, ip_info.gw);
+    config.target_addr = target;
+
+    const esp_ping_callbacks_t callbacks = {
+        .on_ping_success = ping_success,
+        .on_ping_timeout = ping_timeout,
+    };
+    if (esp_ping_new_session(&config, &callbacks, &s_ping) != ESP_OK) {
+        s_ping = NULL;
+        ESP_LOGW(TAG, "Could not create ping session");
+        return;
+    }
+    esp_ping_start(s_ping);
 }
 
 static void wifi_event_handler(void *argument, esp_event_base_t event_base,
@@ -366,6 +476,7 @@ static void wifi_event_handler(void *argument, esp_event_base_t event_base,
         s_diag.last_disconnect_s = uptime_s();
         s_diag.uptime_s = s_diag.last_disconnect_s;
         stop_http_server();
+        stop_gateway_ping();
         arm_noip_timer();
         ESP_LOGW(TAG, "Wi-Fi disconnected (reason %d, total %lu); retry in backoff",
                  event->reason, (unsigned long)s_diag.disconnects);
@@ -373,6 +484,7 @@ static void wifi_event_handler(void *argument, esp_event_base_t event_base,
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) {
         ESP_LOGW(TAG, "Lost IP address");
         stop_http_server();
+        stop_gateway_ping();
         arm_noip_timer();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *event = event_data;
@@ -381,6 +493,7 @@ static void wifi_event_handler(void *argument, esp_event_base_t event_base,
         s_diag.uptime_s = uptime_s();
         ESP_LOGI(TAG, "Connected; open http://" IPSTR, IP2STR(&event->ip_info.ip));
         start_http_server();
+        start_gateway_ping();
     }
 }
 
