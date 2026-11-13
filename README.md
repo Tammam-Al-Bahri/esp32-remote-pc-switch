@@ -52,6 +52,20 @@ All routes need `Authorization: Bearer <token>` and return JSON (errors are
 A successful press returns `202 {"result":"pressed"}`. A press already in
 progress returns `409`; bad input returns `400`; a bad token returns `401`.
 
+Set `TOKEN` to the `PCSW_AUTH_TOKEN` you configured. In the terminal:
+
+```bash
+# bash / zsh / Git Bash
+TOKEN=your-auth-token
+```
+
+```powershell
+# PowerShell (also use curl.exe instead of curl below, since curl is an alias there)
+$TOKEN = "your-auth-token"
+```
+
+Then:
+
 ```bash
 curl -H "Authorization: Bearer $TOKEN" "http://ESP32-IP/status"
 curl -X POST -H "Authorization: Bearer $TOKEN" "http://ESP32-IP/power/on"
