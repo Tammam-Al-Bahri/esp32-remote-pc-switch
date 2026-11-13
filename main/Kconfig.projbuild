@@ -1,35 +1,64 @@
-menu "Relay Wi-Fi Configuration"
+menu "PC Switch Configuration"
 
-    config RELAY_WIFI_SSID
+    config PCSW_WIFI_SSID
         string "Wi-Fi network name (SSID)"
         default ""
         help
             Name of the Wi-Fi network the ESP32 should join.
 
-    config RELAY_WIFI_PASSWORD
+    config PCSW_WIFI_PASSWORD
         string "Wi-Fi password"
         default ""
         help
             Password for the Wi-Fi network.
 
-    config RELAY_CONTROL_PASSWORD
-        string "Relay HTTP password (12 to 64 characters)"
+    config PCSW_AUTH_TOKEN
+        string "HTTP bearer token (12 to 64 characters)"
         default ""
         help
-            Password required in the X-Relay-Password request header.
+            Token required in the "Authorization: Bearer <token>" request header.
 
-    config RELAY_PULSE_MIN_MS
-        int "Minimum relay pulse (milliseconds)"
+    config PCSW_BUTTON_GPIO
+        int "Power button GPIO"
+        range 0 39
+        default 2
+        help
+            GPIO that drives the power button (e.g. via a relay or transistor).
+
+    config PCSW_BUTTON_ACTIVE_HIGH
+        bool "Power button is active high"
+        default y
+        help
+            Enabled: the button is pressed when the GPIO is high.
+            Disabled: the button is pressed when the GPIO is low.
+
+    config PCSW_SENSE_GPIO
+        int "Power sense GPIO"
+        range 0 39
+        default 27
+        help
+            Input GPIO that senses whether the PC is powered on.
+
+    config PCSW_SENSE_ACTIVE_HIGH
+        bool "Power sense is active high"
+        default n
+        help
+            Enabled: the sense input is active when the GPIO is high.
+            Disabled: the sense input is active when the GPIO is low.
+
+    config PCSW_PRESS_MS
+        int "Normal button press (milliseconds)"
+        range 1 30000
+        default 500
+
+    config PCSW_PULSE_MIN_MS
+        int "Minimum pulse accepted over HTTP (milliseconds)"
         range 1 30000
         default 100
-        help
-            Shortest relay pulse duration accepted by the HTTP endpoint.
 
-    config RELAY_PULSE_MAX_MS
-        int "Maximum relay pulse (milliseconds)"
+    config PCSW_PULSE_MAX_MS
+        int "Maximum pulse accepted over HTTP (milliseconds)"
         range 1 30000
-        default 2000
-        help
-            Longest relay pulse duration accepted by the HTTP endpoint.
+        default 10000
 
 endmenu
